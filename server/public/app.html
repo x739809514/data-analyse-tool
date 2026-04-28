@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Game Data Analyse</title>
+    <link rel="stylesheet" href="/assets/app.css">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <h1>Game Data Analyse</h1>
+          <span id="dbStatus">SQLite</span>
+        </div>
+        <div class="server-config">
+          <label>
+            Analysis Backend URL
+            <input id="serverUrlInput" placeholder="http://localhost:3000">
+          </label>
+          <button id="connectServer" type="button">Connect</button>
+          <span id="serverMessage" class="server-message">Not connected</span>
+        </div>
+        <div class="source-config">
+          <label>
+            Data Source
+            <select id="sourceTypeSelect">
+              <option value="sqlite">Local SQLite on backend</option>
+              <option value="cloudflareWorker">Cloudflare Worker</option>
+              <option value="gameLoggerHttp">Game Logger HTTP API</option>
+              <option value="customHttp">Custom Worker / HTTP JSON</option>
+            </select>
+          </label>
+          <label id="sourceUrlLabel">
+            Data Source URL
+            <input id="sourceUrlInput" placeholder="https://your-worker.workers.dev">
+          </label>
+          <label id="sourceConfigLabel">
+            Tables Config JSON
+            <textarea id="sourceConfigInput" spellcheck="false" placeholder='[{"name":"sessions","endpoint":"/session","responseKey":"data"}]'></textarea>
+          </label>
+          <button id="syncSource" type="button">Sync Data Source</button>
+          <span id="syncMessage" class="server-message">No sync yet</span>
+          <span class="server-message">Cloudflare Worker and ECS are configured here as data sources.</span>
+        </div>
+        <button id="refreshTables" class="primary-button" type="button">Refresh</button>
+        <div id="tableList" class="table-list"></div>
+      </aside>
+
+      <section class="workspace">
+        <header class="toolbar">
+          <div>
+            <h2 id="activeTableTitle">Tables</h2>
+            <p id="activeTableMeta">Choose a table to inspect data.</p>
+          </div>
+          <div class="pager">
+            <button id="prevPage" type="button">Previous</button>
+            <span id="pageLabel">Page 1</span>
+            <button id="nextPage" type="button">Next</button>
+          </div>
+        </header>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h3>Data Preview</h3>
+            <span id="rowCount">0 rows</span>
+          </div>
+          <div class="table-wrap">
+            <table id="dataTable"></table>
+          </div>
+        </section>
+
+        <section class="panel sql-panel">
+          <div class="panel-head">
+            <h3>Read-only SQL</h3>
+            <button id="runSql" type="button">Run</button>
+          </div>
+          <textarea id="sqlEditor" spellcheck="false" placeholder="SELECT * FROM sessions LIMIT 50"></textarea>
+          <pre id="sqlMessage"></pre>
+        </section>
+
+        <section class="panel chart-section">
+          <div id="chart"></div>
+        </section>
+      </section>
+
+      <aside class="assistant">
+        <div class="assistant-head">
+          <h2>AI Analyse</h2>
+          <span id="aiMode">Fallback ready</span>
+        </div>
+
+        <div class="provider-grid">
+          <label>
+            Provider
+            <select id="providerSelect"></select>
+          </label>
+          <label>
+            Model
+            <input id="modelInput" placeholder="model name">
+          </label>
+          <label class="full">
+            Base URL
+            <input id="baseUrlInput" placeholder="provider base URL">
+          </label>
+          <label class="full">
+            API Key
+            <input id="apiKeyInput" type="password" placeholder="optional; env vars also work">
+          </label>
+        </div>
+
+        <div id="chatLog" class="chat-log"></div>
+
+        <form id="askForm" class="ask-form">
+          <textarea id="questionInput" placeholder="Analyze users' game time and generate a chart"></textarea>
+          <button type="submit">Analyze</button>
+        </form>
+
+      </aside>
+    </main>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

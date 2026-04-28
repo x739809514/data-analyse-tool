@@ -1,0 +1,14 @@
+{
+  "name": "game-logger-node",
+  "version": "1.0.0",
+  "private": true,
+  "main": "game-logger-server.js",
+  "scripts": {
+    "start": "node game-logger-server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  }
+}
