@@ -160,7 +160,7 @@ app.get('/api/db/tables', async (req, res) => {
         columns: getTableSchema(table.name)
       };
     });
-    res.json({ success: true, tables: tables.concat(listLocalCustomCacheTables()) });
+    res.json({ success: true, tables });
   } catch (error) {
     sendError(res, `Table list error: ${error.message}`, 500);
   }
@@ -954,38 +954,20 @@ function handlePaginatedTable(req, res, options) {
 }
 
 async function respondWithSqlAiAnalysis(res, context) {
-  let plan;
-  if (context.aiConfigured) {
-    plan = await requestAnalysisPlan(context);
-  } else {
-    plan = buildLocalAnalysisPlan(context.question, context.schema);
-  }
-
   const sqlLimit = clamp(parsePositiveInteger(context.limit, 100), 1, CONFIG.maxQueryRows);
-  const prepared = prepareReadOnlySql(plan.sql, sqlLimit);
-  const startedAt = Date.now();
-  const rows = db.prepare(prepared.sql).all();
-  const queryResult = {
-    sql: prepared.sql,
-    rows,
-    columns: rows.length ? Object.keys(rows[0]) : [],
-    rowCount: rows.length,
-    elapsedMs: Date.now() - startedAt
-  };
-
+  const dataContext = buildSqlDataContext(context.schema, context.source);
+  let plan;
+  let queryResult;
   let narrative;
+
   if (context.aiConfigured) {
-    narrative = await requestAnalysisNarrative({
-      provider: context.provider,
-      model: context.model,
-      apiKey: context.apiKey,
-      baseUrl: context.baseUrl,
-      question: context.question,
-      schema: context.schema,
-      plan,
-      queryResult
-    });
+    const agentResult = await runSqlAnalysisAgent({ ...context, dataContext, limit: sqlLimit });
+    plan = agentResult.plan;
+    queryResult = agentResult.queryResult;
+    narrative = agentResult.narrative;
   } else {
+    plan = buildLocalAnalysisPlan(context.question, context.schema, context.source);
+    queryResult = executeAnalysisSql(plan.sql, sqlLimit, context.source, context.schema);
     narrative = buildLocalNarrative(context.question, plan, queryResult);
   }
 
@@ -999,8 +981,415 @@ async function respondWithSqlAiAnalysis(res, context) {
     plan,
     query: queryResult,
     analysis: narrative.analysis,
-    chart: narrative.chart
+    chart: validateChartOption(narrative.chart) ? narrative.chart : null
   });
+}
+
+function executeAnalysisSql(sql, limit, source, schema) {
+  if (source && (source.type === 'gameLoggerHttp' || source.type === 'customHttp') && !String(sql).includes(source.url)) {
+    throw new Error(`SQL must filter the active data source with source_url = '${source.url}'`);
+  }
+  if (schema && schema.length) {
+    validateSqlAgainstSchema(sql, schema);
+  }
+  const prepared = prepareReadOnlySql(sql, limit);
+  const startedAt = Date.now();
+  const rows = db.prepare(prepared.sql).all();
+  return {
+    sql: prepared.sql,
+    rows,
+    columns: rows.length ? Object.keys(rows[0]) : [],
+    rowCount: rows.length,
+    elapsedMs: Date.now() - startedAt,
+    limited: prepared.limited
+  };
+}
+
+function validateSqlAgainstSchema(sql, schema) {
+  const allowedTables = new Map(schema.map((table) => [
+    table.name.toLowerCase(),
+    new Set((table.columns || []).map((column) => column.name.toLowerCase()))
+  ]));
+  const cteNames = extractCteNames(sql);
+  const references = extractTableReferences(sql);
+  const errors = [];
+
+  for (const ref of references) {
+    if (!allowedTables.has(ref.table.toLowerCase()) && !cteNames.has(ref.table.toLowerCase())) {
+      errors.push(`Unknown table "${ref.table}". ${suggestNameMessage(ref.table, Array.from(allowedTables.keys()))}`);
+    }
+  }
+
+  const aliasToTable = new Map();
+  for (const ref of references) {
+    aliasToTable.set(ref.table.toLowerCase(), ref.table.toLowerCase());
+    if (ref.alias) {
+      aliasToTable.set(ref.alias.toLowerCase(), ref.table.toLowerCase());
+    }
+  }
+
+  for (const ref of extractQualifiedColumnReferences(sql)) {
+    const tableName = aliasToTable.get(ref.owner.toLowerCase());
+    if (!tableName || !allowedTables.has(tableName)) continue;
+    const columns = allowedTables.get(tableName);
+    if (!columns.has(ref.column.toLowerCase())) {
+      errors.push(`Unknown column "${ref.owner}.${ref.column}". ${suggestNameMessage(ref.column, Array.from(columns))}`);
+    }
+  }
+
+  const columnAliases = extractColumnAliases(sql);
+  const ignored = buildSqlIgnoredIdentifiers(references, cteNames, columnAliases);
+  const unionColumns = new Set();
+  for (const ref of references) {
+    const columns = allowedTables.get(ref.table.toLowerCase());
+    if (columns) {
+      columns.forEach((column) => unionColumns.add(column));
+    }
+  }
+
+  if (!cteNames.size) {
+    for (const identifier of extractBareIdentifiers(sql)) {
+      const lower = identifier.toLowerCase();
+      if (ignored.has(lower) || unionColumns.has(lower)) continue;
+      if (isSqlKeywordOrFunction(lower)) continue;
+      errors.push(`Unknown identifier "${identifier}". ${suggestNameMessage(identifier, Array.from(unionColumns))}`);
+    }
+  }
+
+  if (errors.length) {
+    throw new Error([
+      'SQL schema validation failed.',
+      ...Array.from(new Set(errors)).slice(0, 8),
+      `Available schema: ${formatSchemaWhitelist(schema)}`
+    ].join(' '));
+  }
+}
+
+function assertSqlUsesPopulatedTables(sql, dataContext) {
+  if (!Array.isArray(dataContext) || !dataContext.length) return;
+  const tableContext = new Map(dataContext.map((table) => [String(table.table).toLowerCase(), table]));
+  const nonEmptyTables = dataContext.filter((table) => Number(table.rowCount || 0) > 0);
+  if (!nonEmptyTables.length) return;
+
+  const errors = [];
+  for (const ref of extractTableReferences(sql)) {
+    const table = tableContext.get(ref.table.toLowerCase());
+    if (!table || Number(table.rowCount || 0) > 0) continue;
+    const replacement = findBestPopulatedTable(table, nonEmptyTables);
+    if (replacement) {
+      errors.push(
+        `Table "${table.table}" has 0 rows. Use non-empty table "${replacement.table}" instead when it has the needed columns: ${(replacement.columns || []).map((column) => column.name).join(', ')}.`
+      );
+    }
+  }
+
+  if (errors.length) {
+    throw new Error(Array.from(new Set(errors)).join(' '));
+  }
+}
+
+function findBestPopulatedTable(emptyTable, nonEmptyTables) {
+  const emptyName = normalizeTableIntentName(emptyTable.table);
+  const emptyColumns = new Set((emptyTable.columns || []).map((column) => normalizeColumnIntentName(column.name)));
+  let best = null;
+  let bestScore = 0;
+
+  for (const table of nonEmptyTables) {
+    const candidateName = normalizeTableIntentName(table.table);
+    const candidateColumns = new Set((table.columns || []).map((column) => normalizeColumnIntentName(column.name)));
+    let score = 0;
+    if (candidateName === emptyName) score += 8;
+    if (candidateName.endsWith(emptyName) || emptyName.endsWith(candidateName)) score += 4;
+    for (const column of emptyColumns) {
+      if (candidateColumns.has(column)) score += 1;
+    }
+    if (score > bestScore) {
+      best = table;
+      bestScore = score;
+    }
+  }
+
+  return bestScore >= 5 ? best : null;
+}
+
+function normalizeTableIntentName(name) {
+  return String(name || '').toLowerCase().replace(/^(custom|remote)_/, '').replace(/s$/, '');
+}
+
+function normalizeColumnIntentName(name) {
+  return String(name || '').toLowerCase().replace(/es$/, '').replace(/s$/, '');
+}
+
+function extractCteNames(sql) {
+  const names = new Set();
+  const text = stripSqlStrings(sql);
+  const regex = /(?:with|,)\s+("?[\w]+"?)\s+as\s*\(/gi;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    names.add(cleanSqlIdentifier(match[1]).toLowerCase());
+  }
+  return names;
+}
+
+function extractTableReferences(sql) {
+  const refs = [];
+  const text = stripSqlStrings(sql);
+  const regex = /\b(from|join)\s+("?[\w]+"?)(?:\s+(?:as\s+)?("?[\w]+"?))?/gi;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const table = cleanSqlIdentifier(match[2]);
+    const alias = match[3] ? cleanSqlIdentifier(match[3]) : '';
+    refs.push({
+      table,
+      alias: alias && !isSqlKeywordOrFunction(alias.toLowerCase()) ? alias : ''
+    });
+  }
+  return refs;
+}
+
+function extractQualifiedColumnReferences(sql) {
+  const refs = [];
+  const text = stripSqlStrings(sql);
+  const regex = /\b("?[\w]+"?)\s*\.\s*("?[\w]+"?)\b/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    refs.push({
+      owner: cleanSqlIdentifier(match[1]),
+      column: cleanSqlIdentifier(match[2])
+    });
+  }
+  return refs;
+}
+
+function extractColumnAliases(sql) {
+  const aliases = new Set();
+  const text = stripSqlStrings(sql);
+  const regex = /\bas\s+("?[\w]+"?)\b|(?:\)|"?[\w]+"?)\s+("?[\w]+"?)(?=\s*(?:,|\bfrom\b))/gi;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    aliases.add(cleanSqlIdentifier(match[1] || match[2]).toLowerCase());
+  }
+  return aliases;
+}
+
+function extractBareIdentifiers(sql) {
+  const text = stripSqlStrings(sql)
+    .replace(/\b[\w]+\s*\.\s*[\w]+\b/g, ' ')
+    .replace(/"[^"]+"/g, ' ');
+  return text.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || [];
+}
+
+function buildSqlIgnoredIdentifiers(references, cteNames, columnAliases) {
+  const ignored = new Set([...cteNames, ...columnAliases]);
+  for (const ref of references) {
+    ignored.add(ref.table.toLowerCase());
+    if (ref.alias) ignored.add(ref.alias.toLowerCase());
+  }
+  return ignored;
+}
+
+function stripSqlStrings(sql) {
+  return String(sql || '').replace(/'([^']|'')*'/g, "''");
+}
+
+function cleanSqlIdentifier(identifier) {
+  return String(identifier || '').replace(/^"|"$/g, '');
+}
+
+function isSqlKeywordOrFunction(value) {
+  return new Set([
+    'select', 'from', 'where', 'join', 'left', 'right', 'inner', 'outer', 'on', 'and', 'or',
+    'group', 'by', 'order', 'limit', 'offset', 'as', 'with', 'case', 'when', 'then', 'else',
+    'end', 'is', 'not', 'null', 'in', 'between', 'like', 'distinct', 'having', 'over',
+    'partition', 'asc', 'desc', 'count', 'sum', 'avg', 'min', 'max', 'round', 'cast',
+    'coalesce', 'ifnull', 'strftime', 'date', 'datetime', 'julianday', 'unixepoch',
+    'substr', 'substring', 'length', 'lower', 'upper', 'trim', 'replace', 'abs',
+    'printf', 'json_extract', 'json_each', 'json_tree', 'regexp', 'glob', 'collate',
+    'exists', 'union', 'all', 'intersect', 'except', 'first', 'last', 'nulls',
+    'true', 'false', 'total', 'value', 'values'
+  ]).has(value);
+}
+
+function suggestNameMessage(name, candidates) {
+  const suggestion = findClosestName(name, candidates);
+  return suggestion ? `Did you mean "${suggestion}"?` : `Available: ${candidates.slice(0, 20).join(', ')}`;
+}
+
+function findClosestName(name, candidates) {
+  let best = '';
+  let bestDistance = Infinity;
+  for (const candidate of candidates) {
+    const distance = levenshtein(String(name).toLowerCase(), String(candidate).toLowerCase());
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  return bestDistance <= Math.max(2, Math.floor(String(name).length / 3)) ? best : '';
+}
+
+function levenshtein(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i += 1) dp[i][0] = i;
+  for (let j = 0; j <= b.length; j += 1) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+function formatSchemaWhitelist(schema) {
+  return schema.map((table) => `${table.name}(${(table.columns || []).map((column) => column.name).join(', ')})`).join('; ');
+}
+
+async function runSqlAnalysisAgent(context) {
+  const observations = [];
+  const maxSteps = 5;
+
+  for (let step = 0; step < maxSteps; step += 1) {
+    const action = await requestAgentAction(context, observations, step);
+    if (action.done) {
+      return finalizeAgentResult(context, observations, action);
+    }
+
+    const sql = String(action.sql || '').trim();
+    if (!sql) {
+      observations.push({ step, error: 'Agent did not provide sql for query action.' });
+      continue;
+    }
+
+    try {
+      assertSqlUsesPopulatedTables(sql, context.dataContext);
+      const result = executeAnalysisSql(sql, context.limit, context.source, context.schema);
+      observations.push({
+        step,
+        reason: String(action.reason || ''),
+        sql: result.sql,
+        columns: result.columns,
+        rowCount: result.rowCount,
+        rows: result.rows.slice(0, 80),
+        elapsedMs: result.elapsedMs
+      });
+    } catch (error) {
+      observations.push({
+        step,
+        reason: String(action.reason || ''),
+        sql,
+        error: error.message
+      });
+    }
+  }
+
+  return finalizeAgentResult(context, observations, { done: true });
+}
+
+async function requestAgentAction(context, observations, step) {
+  const wantsChart = shouldGenerateChart(context.question);
+  const system = [
+    'You are an autonomous but constrained game data analysis agent.',
+    'You cannot access the database directly. You may request one read-only SQLite query at a time.',
+    'Return only JSON.',
+    'If you need more data, return {"done":false,"reason":"...","sql":"SELECT ..."}',
+    'If you have enough evidence, return {"done":true,"title":"...","analysis":"...","rows":[...],"columns":[...],"chart":null}.',
+    'Use multiple queries when needed: inspect distributions, totals, groups, and edge cases before finalizing.',
+    'Never guess when a query can verify it.',
+    'Prefer tables with rowCount > 0 from the data context. Do not query a 0-row table when a non-empty synced/custom table has the needed columns.',
+    'Treat table and column names as exact SQLite identifiers. For example, custom_sessions.progresses is different from sessions.progress.',
+    wantsChart ? 'If the user asks for a chart, include a valid ECharts option in the final chart field.' : 'Do not include a chart unless the user asked for one.',
+    context.source && (context.source.type === 'gameLoggerHttp' || context.source.type === 'customHttp')
+      ? `Every SQL query must filter source_url = '${escapeSqlLiteral(context.source.url)}'.`
+      : '',
+    'Only use tables and columns from the schema/data context.'
+  ].join(' ');
+
+  const prompt = [
+    `Step: ${step + 1}/${5}`,
+    `Question: ${context.question}`,
+    `Schema JSON: ${JSON.stringify(context.schema)}`,
+    `Data context JSON: ${JSON.stringify(context.dataContext || [])}`,
+    `Previous observations JSON: ${JSON.stringify(observations)}`,
+    'Choose the next query or finish.'
+  ].join('\n\n');
+
+  const content = await callAiText(context, [
+    { role: 'system', content: system },
+    { role: 'user', content: prompt }
+  ]);
+  return parseJsonFromText(content);
+}
+
+async function finalizeAgentResult(context, observations, action) {
+  const lastObservation = [...observations].reverse().find((item) => !item.error && Array.isArray(item.rows)) || {
+    sql: 'No successful SQL query',
+    rows: [],
+    columns: [],
+    rowCount: 0,
+    elapsedMs: 0
+  };
+
+  let final = action && action.analysis ? action : null;
+  if (!final) {
+    final = await requestAgentFinalAnswer(context, observations);
+  }
+
+  const rows = Array.isArray(final.rows) ? final.rows.slice(0, CONFIG.maxQueryRows) : lastObservation.rows || [];
+  const columns = Array.isArray(final.columns) && final.columns.length
+    ? final.columns.map(String)
+    : rows.length ? Object.keys(rows[0]) : lastObservation.columns || [];
+  const plan = {
+    title: String(final.title || 'AI Analysis'),
+    sql: String(lastObservation.sql || 'AI multi-step SQL analysis'),
+    chartType: shouldGenerateChart(context.question) ? 'auto' : 'none',
+    xField: '',
+    yField: '',
+    notes: `AI agent used ${observations.length} step(s).`
+  };
+
+  const queryResult = {
+    sql: observations.map((item) => item.sql || item.error).filter(Boolean).join('\n\n'),
+    rows,
+    columns,
+    rowCount: rows.length,
+    elapsedMs: observations.reduce((total, item) => total + (item.elapsedMs || 0), 0)
+  };
+
+  return {
+    plan,
+    queryResult,
+    narrative: {
+      analysis: String(final.analysis || 'Analysis completed.'),
+      chart: shouldGenerateChart(context.question)
+        ? validateChartOption(final.chart) ? final.chart : buildChartOption(plan, rows)
+        : null
+    }
+  };
+}
+
+async function requestAgentFinalAnswer(context, observations) {
+  const wantsChart = shouldGenerateChart(context.question);
+  const system = [
+    'You write final data analysis answers from executed SQL observations.',
+    'Return only JSON with keys: title, analysis, rows, columns, chart.',
+    'rows must be a concise result table derived from observations.',
+    wantsChart ? 'chart must be a valid ECharts option.' : 'chart must be null.'
+  ].join(' ');
+  const prompt = [
+    `Question: ${context.question}`,
+    `Schema JSON: ${JSON.stringify(context.schema)}`,
+    `Observations JSON: ${JSON.stringify(observations)}`,
+    'Return the final answer JSON.'
+  ].join('\n\n');
+  const content = await callAiText(context, [
+    { role: 'system', content: system },
+    { role: 'user', content: prompt }
+  ]);
+  return parseJsonFromText(content);
 }
 
 function deleteOldLogs(retentionDays) {
@@ -1541,7 +1930,12 @@ function getRemoteMirrorTableName(remoteTableName) {
 }
 
 function hasSyncedRemoteSource(source) {
-  const row = db.prepare('SELECT COUNT(*) AS total FROM remote_sync_meta WHERE source_url = ?').get(source.url);
+  const row = db.prepare(`
+    SELECT COUNT(*) AS total
+    FROM remote_sync_meta
+    WHERE source_url = ?
+      AND table_name IN ('remote_users', 'remote_sessions', 'remote_coffee_sessions', 'remote_plant_sessions')
+  `).get(source.url);
   return row.total > 0;
 }
 
@@ -1550,6 +1944,7 @@ function getRemoteSyncStatus(source) {
     SELECT table_name AS tableName, synced_at AS syncedAt, row_count AS rowCount, total_rows AS totalRows
     FROM remote_sync_meta
     WHERE source_url = ?
+      AND table_name IN ('remote_users', 'remote_sessions', 'remote_coffee_sessions', 'remote_plant_sessions')
     ORDER BY table_name ASC
   `).all(source.url);
   return rows.map((row) => ({
@@ -2048,69 +2443,28 @@ async function analyzeCustomHttpSource(options) {
 
 async function analyzeSyncedCustomSqliteSource(options, limit) {
   const schema = getCustomHttpSchema(options.source);
-  if (!options.aiConfigured) {
-    const firstTable = schema[0] && schema[0].name;
-    const rows = firstTable
-      ? db.prepare(`SELECT * FROM ${quoteIdentifier(firstTable)} WHERE source_url = ? LIMIT ?`).all(options.source.url, limit)
-      : [];
-    return {
-      plan: {
-        title: firstTable || 'Custom HTTP Analysis',
-        sql: firstTable ? `SELECT * FROM ${quoteIdentifier(firstTable)} WHERE source_url = '${escapeSqlLiteral(options.source.url)}' LIMIT ${limit}` : 'No synced custom table',
-        chartType: 'none',
-        xField: '',
-        yField: '',
-        notes: 'Configure an AI provider for flexible SQL analysis.'
-      },
-      query: {
-        sql: firstTable ? `SELECT * FROM ${quoteIdentifier(firstTable)} WHERE source_url = '${escapeSqlLiteral(options.source.url)}' LIMIT ${limit}` : 'No synced custom table',
-        rows,
-        columns: rows.length ? Object.keys(rows[0]) : [],
-        rowCount: rows.length,
-        elapsedMs: 0
-      },
-      analysis: firstTable ? `已读取 ${firstTable} 的 ${rows.length} 行同步数据。` : '这个自定义数据源还没有同步数据。',
-      chart: null
-    };
-  }
-
-  const plan = await requestAnalysisPlan({
+  const fakeRes = {
+    payload: null,
+    json(payload) {
+      this.payload = payload;
+    }
+  };
+  await respondWithSqlAiAnalysis(fakeRes, {
     provider: options.provider,
     model: options.model,
     apiKey: options.apiKey,
     baseUrl: options.baseUrl,
     question: options.question,
     schema,
+    aiConfigured: options.aiConfigured,
+    limit,
     source: options.source
   });
-  if (!plan.sql.includes(options.source.url)) {
-    throw new Error(`AI SQL must filter source_url = '${options.source.url}'`);
-  }
-  const prepared = prepareReadOnlySql(plan.sql, limit);
-  const startedAt = Date.now();
-  const rows = db.prepare(prepared.sql).all();
-  const queryResult = {
-    sql: prepared.sql,
-    rows,
-    columns: rows.length ? Object.keys(rows[0]) : [],
-    rowCount: rows.length,
-    elapsedMs: Date.now() - startedAt
-  };
-  const narrative = await requestAnalysisNarrative({
-    provider: options.provider,
-    model: options.model,
-    apiKey: options.apiKey,
-    baseUrl: options.baseUrl,
-    question: options.question,
-    schema,
-    plan,
-    queryResult
-  });
   return {
-    plan,
-    query: queryResult,
-    analysis: narrative.analysis,
-    chart: narrative.chart
+    plan: fakeRes.payload.plan,
+    query: fakeRes.payload.query,
+    analysis: fakeRes.payload.analysis,
+    chart: fakeRes.payload.chart
   };
 }
 
@@ -2180,6 +2534,73 @@ function getDatabaseSchema() {
     name: table.name,
     columns: getTableSchema(table.name)
   }));
+}
+
+function buildSqlDataContext(schema, source) {
+  return schema.map((table) => {
+    if (!doesTableExist(table.name)) {
+      return {
+        table: table.name,
+        columns: table.columns,
+        rowCount: 0,
+        samples: [],
+        stats: {}
+      };
+    }
+
+    const where = source && (source.type === 'gameLoggerHttp' || source.type === 'customHttp') && hasColumn(table.name, 'source_url')
+      ? ` WHERE source_url = '${escapeSqlLiteral(source.url)}'`
+      : '';
+    const rowCount = db.prepare(`SELECT COUNT(*) AS total FROM ${quoteIdentifier(table.name)}${where}`).get().total;
+    const samples = db.prepare(`SELECT * FROM ${quoteIdentifier(table.name)}${where} LIMIT 5`).all();
+    return {
+      table: table.name,
+      columns: table.columns,
+      rowCount,
+      samples,
+      stats: buildColumnStats(table.name, table.columns, where)
+    };
+  }).sort((a, b) => {
+    if (b.rowCount !== a.rowCount) return b.rowCount - a.rowCount;
+    return a.table.localeCompare(b.table);
+  });
+}
+
+function buildColumnStats(tableName, columns, whereSql) {
+  const stats = {};
+  for (const column of columns.slice(0, 20)) {
+    if (['raw_json'].includes(column.name)) continue;
+    try {
+      const distinct = db.prepare(`
+        SELECT COUNT(DISTINCT ${quoteIdentifier(column.name)}) AS total
+        FROM ${quoteIdentifier(tableName)}${whereSql}
+      `).get().total;
+      const examples = db.prepare(`
+        SELECT ${quoteIdentifier(column.name)} AS value, COUNT(*) AS count
+        FROM ${quoteIdentifier(tableName)}${whereSql}
+        WHERE ${quoteIdentifier(column.name)} IS NOT NULL
+        GROUP BY ${quoteIdentifier(column.name)}
+        ORDER BY count DESC
+        LIMIT 8
+      `).all();
+      stats[column.name] = { distinct, examples };
+    } catch (_error) {
+      stats[column.name] = { distinct: null, examples: [] };
+    }
+  }
+  return stats;
+}
+
+function hasColumn(tableName, columnName) {
+  return getTableSchema(tableName).some((column) => column.name === columnName);
+}
+
+function getTableRowCount(tableName, source) {
+  if (!doesTableExist(tableName)) return 0;
+  if (source && (source.type === 'gameLoggerHttp' || source.type === 'customHttp') && hasColumn(tableName, 'source_url')) {
+    return db.prepare(`SELECT COUNT(*) AS total FROM ${quoteIdentifier(tableName)} WHERE source_url = ?`).get(source.url).total;
+  }
+  return db.prepare(`SELECT COUNT(*) AS total FROM ${quoteIdentifier(tableName)}`).get().total;
 }
 
 function assertKnownTable(tableName) {
@@ -2305,14 +2726,19 @@ function getProviderApiKey(provider) {
 
 async function requestAnalysisPlan(context) {
   const system = [
-    'You generate safe SQLite analysis plans.',
+    'You are a careful game data analyst generating safe SQLite analysis plans.',
     'Return only JSON with keys: title, sql, chartType, xField, yField, notes.',
     'The SQL must be a single read-only SELECT or WITH query.',
     'Prefer aggregated results and include aliases that are easy to chart.',
-    context.source && context.source.type === 'gameLoggerHttp'
+    'Use only tables and columns present in the provided context.',
+    'Use the sample rows and column stats to understand field meanings and value ranges.',
+    'Prefer tables with rowCount > 0 from the data context. Do not query a 0-row table when a non-empty synced/custom table has the needed columns.',
+    'Treat table and column names as exact SQLite identifiers. For example, custom_sessions.progresses is different from sessions.progress.',
+    'For percentage/proportion questions, compute both counts and percentages.',
+    context.source && (context.source.type === 'gameLoggerHttp' || context.source.type === 'customHttp')
       ? `For remote synced tables, filter every query with source_url = '${escapeSqlLiteral(context.source.url)}'.`
       : '',
-    context.source && context.source.type === 'gameLoggerHttp'
+    context.source && (context.source.type === 'gameLoggerHttp' || context.source.type === 'customHttp')
       ? 'Remote synced time columns are TEXT in YYYY-MM-DD HH:mm:ss format. For duration calculations in SQLite, use strftime(\'%s\', end_time) - strftime(\'%s\', start_time).'
       : ''
   ].join(' ');
@@ -2320,6 +2746,7 @@ async function requestAnalysisPlan(context) {
   const prompt = [
     `Question: ${context.question}`,
     `Schema JSON: ${JSON.stringify(context.schema)}`,
+    `Data context JSON: ${JSON.stringify(context.dataContext || [])}`,
     'Return the plan JSON now.'
   ].join('\n\n');
 
@@ -2331,6 +2758,46 @@ async function requestAnalysisPlan(context) {
   const parsed = parseJsonFromText(content);
   if (!parsed.sql) {
     throw new Error('AI plan did not include sql');
+  }
+  return {
+    title: String(parsed.title || 'AI Analysis'),
+    sql: String(parsed.sql),
+    chartType: String(parsed.chartType || 'bar'),
+    xField: parsed.xField ? String(parsed.xField) : '',
+    yField: parsed.yField ? String(parsed.yField) : '',
+    notes: String(parsed.notes || '')
+  };
+}
+
+async function requestAnalysisPlanRepair(context) {
+  const system = [
+    'You repair SQLite analysis plans.',
+    'Return only JSON with keys: title, sql, chartType, xField, yField, notes.',
+    'The SQL must be one read-only SELECT or WITH query.',
+    'Use only provided tables and columns.',
+    'Prefer tables with rowCount > 0 from the data context. Do not query a 0-row table when a non-empty synced/custom table has the needed columns.',
+    'Treat table and column names as exact SQLite identifiers.',
+    context.source && (context.source.type === 'gameLoggerHttp' || context.source.type === 'customHttp')
+      ? `The SQL must include source_url = '${escapeSqlLiteral(context.source.url)}'.`
+      : ''
+  ].join(' ');
+
+  const prompt = [
+    `Question: ${context.question}`,
+    `Schema JSON: ${JSON.stringify(context.schema)}`,
+    `Data context JSON: ${JSON.stringify(context.dataContext || [])}`,
+    `Previous plan: ${JSON.stringify(context.previousPlan || {})}`,
+    `Failed attempts: ${JSON.stringify(context.attempts || [])}`,
+    'Return a corrected plan JSON.'
+  ].join('\n\n');
+
+  const content = await callAiText(context, [
+    { role: 'system', content: system },
+    { role: 'user', content: prompt }
+  ]);
+  const parsed = parseJsonFromText(content);
+  if (!parsed.sql) {
+    throw new Error('AI repaired plan did not include sql');
   }
   return {
     title: String(parsed.title || 'AI Analysis'),
@@ -2359,6 +2826,7 @@ async function requestAnalysisNarrative(context) {
   const prompt = [
     `Question: ${context.question}`,
     `Plan: ${JSON.stringify(context.plan)}`,
+    `Data context summary: ${JSON.stringify((context.dataContext || []).map((table) => ({ table: table.table, rowCount: table.rowCount, columns: table.columns.map((column) => column.name) })))}`,
     `SQL result: ${JSON.stringify({ columns: context.queryResult.columns, rows: rowsForAi, rowCount: context.queryResult.rowCount })}`,
     wantsChart
       ? 'Return concise findings and an ECharts option.'
@@ -2373,8 +2841,17 @@ async function requestAnalysisNarrative(context) {
   const parsed = parseJsonFromText(content);
   return {
     analysis: String(parsed.analysis || 'Analysis completed.'),
-    chart: wantsChart ? parsed.chart || buildChartOption(context.plan, context.queryResult.rows) : null
+    chart: wantsChart ? validateChartOption(parsed.chart) ? parsed.chart : buildChartOption(context.plan, context.queryResult.rows) : null
   };
+}
+
+function validateChartOption(option) {
+  return Boolean(
+    option &&
+    typeof option === 'object' &&
+    (Array.isArray(option.series) || option.series) &&
+    (option.xAxis || option.yAxis || option.series)
+  );
 }
 
 async function callAiText(context, messages) {
@@ -2437,14 +2914,18 @@ async function callAnthropic(context, messages) {
 async function callGemini(context, messages) {
   const endpoint = `${context.baseUrl.replace(/\/+$/g, '')}/models/${encodeURIComponent(context.model)}:generateContent?key=${encodeURIComponent(context.apiKey)}`;
   const text = messages.map((message) => `${message.role.toUpperCase()}:\n${message.content}`).join('\n\n');
+  const generationConfig = {
+    temperature: 0.2,
+    responseMimeType: 'application/json'
+  };
+  if (/gemini-3/i.test(context.model)) {
+    generationConfig.thinkingConfig = { thinkingLevel: 'high' };
+  }
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      generationConfig: {
-        temperature: 0.2,
-        responseMimeType: 'application/json'
-      },
+      generationConfig,
       contents: [{ role: 'user', parts: [{ text }] }]
     })
   });
@@ -2481,10 +2962,76 @@ function parseJsonFromText(text) {
   }
 }
 
-function buildLocalAnalysisPlan(question, schema) {
-  const hasSessions = schema.some((table) => table.name === 'sessions');
+function buildLocalAnalysisPlan(question, schema, source) {
+  const sessionLikeTables = schema
+    .filter((table) => {
+      const columnNames = new Set((table.columns || []).map((column) => column.name));
+      return columnNames.has('user_id') && (columnNames.has('progress') || columnNames.has('progresses') || columnNames.has('start_time'));
+    })
+    .map((table) => ({
+      ...table,
+      rowCount: getTableRowCount(table.name, source)
+    }))
+    .sort((a, b) => {
+      if (b.rowCount !== a.rowCount) return b.rowCount - a.rowCount;
+      return a.name.localeCompare(b.name);
+    });
+  const bestSessionTable = sessionLikeTables[0];
   const wantsGameTime = /time|时长|游戏|play|session|active/i.test(question);
-  if (hasSessions && wantsGameTime) {
+  const wantsProgress = /progress|进度|关卡|level/i.test(question);
+  if (wantsProgress) {
+    const progressTable = sessionLikeTables.find((table) => {
+      const columnNames = new Set((table.columns || []).map((column) => column.name));
+      return columnNames.has('progress') || columnNames.has('progresses');
+    });
+    if (progressTable) {
+      const columnNames = new Set((progressTable.columns || []).map((column) => column.name));
+      const progressColumn = columnNames.has('progresses') ? 'progresses' : 'progress';
+      const where = buildSourceWhereClause(progressTable.name, source);
+      return {
+        title: 'Progress By User',
+        sql: `
+          SELECT
+            user_id,
+            MAX(${quoteIdentifier(progressColumn)}) AS max_progress,
+            COUNT(*) AS session_count
+          FROM ${quoteIdentifier(progressTable.name)}
+          ${where}
+          GROUP BY user_id
+          ORDER BY max_progress DESC
+        `,
+        chartType: 'bar',
+        xField: 'user_id',
+        yField: 'max_progress',
+        notes: `Local fallback used ${progressTable.name} because it has the most relevant local rows.`
+      };
+    }
+  }
+
+  if (bestSessionTable && wantsProgress) {
+    return {
+      title: `Preview ${bestSessionTable.name}`,
+      sql: `SELECT * FROM ${quoteIdentifier(bestSessionTable.name)}${buildSourceWhereClause(bestSessionTable.name, source)}`,
+      chartType: 'bar',
+      xField: '',
+      yField: '',
+      notes: `Local fallback used ${bestSessionTable.name}; no progress/progresses column was available for progress analysis.`
+    };
+  }
+
+  if (bestSessionTable && wantsGameTime) {
+    const columnNames = new Set((bestSessionTable.columns || []).map((column) => column.name));
+    const hasTimeRange = columnNames.has('start_time') && columnNames.has('end_time');
+    if (!hasTimeRange) {
+      return {
+        title: `Preview ${bestSessionTable.name}`,
+        sql: `SELECT * FROM ${quoteIdentifier(bestSessionTable.name)}${buildSourceWhereClause(bestSessionTable.name, source)}`,
+        chartType: 'bar',
+        xField: '',
+        yField: '',
+        notes: `Local fallback used ${bestSessionTable.name}; no start_time/end_time columns were available for duration analysis.`
+      };
+    }
     return {
       title: 'Game Time By User',
       sql: `
@@ -2492,26 +3039,40 @@ function buildLocalAnalysisPlan(question, schema) {
           user_id,
           ROUND(SUM(CASE WHEN end_time IS NOT NULL THEN MAX(end_time - start_time, 0) ELSE 0 END) / 60000.0, 2) AS total_minutes,
           COUNT(*) AS session_count
-        FROM sessions
+        FROM ${quoteIdentifier(bestSessionTable.name)}
+        ${buildSourceWhereClause(bestSessionTable.name, source)}
         GROUP BY user_id
         ORDER BY total_minutes DESC
       `,
       chartType: 'bar',
       xField: 'user_id',
       yField: 'total_minutes',
-      notes: 'Local fallback plan used because no AI provider was configured.'
+      notes: `Local fallback used ${bestSessionTable.name} because it has the most relevant local rows.`
     };
   }
 
-  const firstTable = schema[0] && schema[0].name;
+  const rankedTables = schema
+    .map((table) => ({ ...table, rowCount: getTableRowCount(table.name, source) }))
+    .sort((a, b) => {
+      if (b.rowCount !== a.rowCount) return b.rowCount - a.rowCount;
+      return a.name.localeCompare(b.name);
+    });
+  const firstTable = rankedTables[0] && rankedTables[0].name;
   return {
     title: firstTable ? `Preview ${firstTable}` : 'Database Preview',
-    sql: firstTable ? `SELECT * FROM ${quoteIdentifier(firstTable)}` : 'SELECT 1 AS value',
+    sql: firstTable ? `SELECT * FROM ${quoteIdentifier(firstTable)}${buildSourceWhereClause(firstTable, source)}` : 'SELECT 1 AS value',
     chartType: 'bar',
     xField: '',
     yField: '',
     notes: 'Local fallback plan used because no AI provider was configured.'
   };
+}
+
+function buildSourceWhereClause(tableName, source) {
+  if (source && (source.type === 'gameLoggerHttp' || source.type === 'customHttp') && hasColumn(tableName, 'source_url')) {
+    return ` WHERE source_url = '${escapeSqlLiteral(source.url)}'`;
+  }
+  return '';
 }
 
 function buildLocalNarrative(question, plan, queryResult) {

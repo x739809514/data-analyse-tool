@@ -86,16 +86,18 @@ function bindEvents() {
     els.serverUrlInput.value = state.serverUrl;
     saveSettings();
   });
-  els.sourceTypeSelect.addEventListener('change', () => {
+  els.sourceTypeSelect.addEventListener('change', async () => {
     state.sourceType = els.sourceTypeSelect.value;
     syncSourceControls();
     syncSqlControls();
     saveSettings();
+    await reloadCurrentSourceView();
   });
-  els.sourceUrlInput.addEventListener('change', () => {
+  els.sourceUrlInput.addEventListener('change', async () => {
     state.sourceUrl = normalizeOptionalUrl(els.sourceUrlInput.value);
     els.sourceUrlInput.value = state.sourceUrl;
     saveSettings();
+    await reloadCurrentSourceView();
   });
   els.sourceConfigInput.addEventListener('input', () => {
     state.sourceConfig = els.sourceConfigInput.value.trim();
@@ -136,8 +138,14 @@ async function loadTables() {
   state.hasSyncedRemote = state.sourceType !== 'sqlite' && state.tables.some((table) => table.synced);
   renderTableList();
   syncSqlControls();
+  if (state.activeTable && !state.tables.some((table) => table.name === state.activeTable)) {
+    state.activeTable = '';
+    clearTableView();
+  }
   if (!state.activeTable && state.tables[0]) {
     await selectTable(state.tables[0].name);
+  } else if (!state.tables.length) {
+    clearTableView();
   }
 }
 
@@ -176,6 +184,32 @@ function renderTableList() {
   els.tableList.querySelectorAll('button').forEach((button) => {
     button.addEventListener('click', () => selectTable(button.dataset.table));
   });
+}
+
+async function reloadCurrentSourceView() {
+  state.activeTable = '';
+  state.page = 1;
+  state.totalPages = 1;
+  state.tables = [];
+  clearTableView();
+  renderTableList();
+  if (state.sourceType !== 'sqlite' && !state.sourceUrl) {
+    setSyncMessage('Enter a data source URL, then sync or refresh.', '');
+    syncSqlControls();
+    return;
+  }
+  await loadTables();
+  await loadSyncStatus();
+}
+
+function clearTableView() {
+  els.activeTableTitle.textContent = 'Select a table';
+  els.activeTableMeta.textContent = '';
+  els.rowCount.textContent = '0 rows';
+  els.pageLabel.textContent = 'Page 1 / 1';
+  els.prevPage.disabled = true;
+  els.nextPage.disabled = true;
+  els.dataTable.innerHTML = '<tbody><tr><td>No table selected</td></tr></tbody>';
 }
 
 async function selectTable(tableName) {
