@@ -1,21 +1,26 @@
-const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const Database = require('better-sqlite3');
-
-const CONFIG = {
-  port: parseInt(process.env.PORT || '3000', 10),
-  adminApiKey: process.env.ADMIN_API_KEY || '',
-  retentionDays: parseInt(process.env.RETENTION_DAYS || '7', 10),
-  dbPath: process.env.DB_PATH || path.join(__dirname, 'data', 'game-logger.db'),
-  debugMode: String(process.env.DEBUG_MODE || 'false').toLowerCase() === 'true',
-  aiProvider: process.env.AI_PROVIDER || 'openai',
-  aiModel: process.env.AI_MODEL || '',
-  aiBaseUrl: process.env.AI_BASE_URL || '',
-  maxQueryRows: parseInt(process.env.MAX_QUERY_ROWS || '500', 10)
-};
+const {
+  CONFIG,
+  ensureDataDirectory,
+  getProviderApiKey,
+  getProviderPresets
+} = require('./src/config');
+const { initSchema } = require('./src/schema');
+const {
+  generateLogViewHTML,
+  generatePlayerListHTML
+} = require('./src/logViews');
+const {
+  clamp,
+  escapeHtml,
+  parsePositiveInteger,
+  quoteIdentifier,
+  safeJsonParse
+} = require('./src/utils');
 
 const REMOTE_FIELD_ALIASES = {
   id: ['id', 'ID', 'session_id', 'sessionId', 'SessionId'],
@@ -111,7 +116,7 @@ app.get('/api/meta', (req, res) => {
     res.json({
       success: true,
       database: {
-        type: source.type,
+        type: source.sourceKind || source.type,
         path: source.type === 'sqlite' ? CONFIG.dbPath : source.url
       },
       ai: {
@@ -771,126 +776,6 @@ app.listen(CONFIG.port, () => {
   console.log(`SQLite DB: ${CONFIG.dbPath}`);
 });
 
-function initSchema(database) {
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      start_time INTEGER NOT NULL,
-      end_time INTEGER,
-      progress INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS coffee_sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      start_time INTEGER NOT NULL,
-      end_time INTEGER,
-      npc TEXT DEFAULT ''
-    );
-
-    CREATE TABLE IF NOT EXISTS plant_sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      start_time INTEGER NOT NULL,
-      end_time INTEGER,
-      plant TEXT DEFAULT ''
-    );
-
-    CREATE TABLE IF NOT EXISTS log_owners (
-      owner TEXT PRIMARY KEY,
-      created_at TEXT NOT NULL,
-      last_updated TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS log_sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      owner TEXT NOT NULL,
-      session_id TEXT NOT NULL,
-      collection_time TEXT,
-      received_at TEXT NOT NULL,
-      logs_json TEXT NOT NULL,
-      FOREIGN KEY(owner) REFERENCES log_owners(owner) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS remote_sync_meta (
-      source_url TEXT NOT NULL,
-      table_name TEXT NOT NULL,
-      synced_at TEXT NOT NULL,
-      row_count INTEGER NOT NULL,
-      total_rows INTEGER NOT NULL,
-      PRIMARY KEY(source_url, table_name)
-    );
-
-    CREATE TABLE IF NOT EXISTS remote_users (
-      source_url TEXT NOT NULL,
-      id TEXT NOT NULL,
-      created_at TEXT,
-      raw_json TEXT NOT NULL,
-      synced_at TEXT NOT NULL,
-      PRIMARY KEY(source_url, id)
-    );
-
-    CREATE TABLE IF NOT EXISTS remote_sessions (
-      source_url TEXT NOT NULL,
-      id TEXT NOT NULL,
-      user_id TEXT,
-      start_time TEXT,
-      end_time TEXT,
-      progress INTEGER,
-      raw_json TEXT NOT NULL,
-      synced_at TEXT NOT NULL,
-      PRIMARY KEY(source_url, id)
-    );
-
-    CREATE TABLE IF NOT EXISTS remote_coffee_sessions (
-      source_url TEXT NOT NULL,
-      id TEXT NOT NULL,
-      user_id TEXT,
-      start_time TEXT,
-      end_time TEXT,
-      npc TEXT,
-      raw_json TEXT NOT NULL,
-      synced_at TEXT NOT NULL,
-      PRIMARY KEY(source_url, id)
-    );
-
-    CREATE TABLE IF NOT EXISTS remote_plant_sessions (
-      source_url TEXT NOT NULL,
-      id TEXT NOT NULL,
-      user_id TEXT,
-      start_time TEXT,
-      end_time TEXT,
-      plant TEXT,
-      raw_json TEXT NOT NULL,
-      synced_at TEXT NOT NULL,
-      PRIMARY KEY(source_url, id)
-    );
-
-    CREATE TABLE IF NOT EXISTS remote_generic_rows (
-      source_url TEXT NOT NULL,
-      table_name TEXT NOT NULL,
-      row_id TEXT NOT NULL,
-      raw_json TEXT NOT NULL,
-      synced_at TEXT NOT NULL,
-      PRIMARY KEY(source_url, table_name, row_id)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON sessions(start_time DESC);
-    CREATE INDEX IF NOT EXISTS idx_coffee_start_time ON coffee_sessions(start_time DESC);
-    CREATE INDEX IF NOT EXISTS idx_plant_start_time ON plant_sessions(start_time DESC);
-    CREATE INDEX IF NOT EXISTS idx_log_owner_received_at ON log_sessions(owner, received_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_remote_sessions_source_progress ON remote_sessions(source_url, progress);
-    CREATE INDEX IF NOT EXISTS idx_remote_sessions_source_user ON remote_sessions(source_url, user_id);
-    CREATE INDEX IF NOT EXISTS idx_remote_generic_source_table ON remote_generic_rows(source_url, table_name);
-  `);
-}
-
 function backfillRemoteMirrorTypedColumns(database) {
   const transaction = database.transaction(() => {
     for (const config of Object.values(REMOTE_MIRROR_CONFIG)) {
@@ -1422,11 +1307,14 @@ function getRequestSource(req) {
     return { type: 'customHttp', url, tables: parseCustomSourceTables(configText) };
   }
 
-  if (type === 'gameLoggerHttp' || type === 'cloudflareWorker') {
+  if (type === 'gameLoggerHttp' || type === 'cloudflareWorker' || type === 'amazonIvyServer') {
     if (!url || !/^https?:\/\//i.test(url)) {
       throw new Error('A valid Data Source URL is required for Game Logger HTTP API');
     }
-    return { type: 'gameLoggerHttp', url };
+    if (type === 'amazonIvyServer' && !/^https:\/\//i.test(url)) {
+      throw new Error('AmazonIvyServer data sources must use an HTTPS URL');
+    }
+    return { type: 'gameLoggerHttp', sourceKind: type, url };
   }
 
   return { type: 'sqlite', url: '' };
@@ -2668,62 +2556,6 @@ function prepareReadOnlySql(inputSql, requestedLimit) {
   return { sql, limited };
 }
 
-function quoteIdentifier(identifier) {
-  return `"${String(identifier).replace(/"/g, '""')}"`;
-}
-
-function clamp(value, min, max) {
-  const parsed = parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return min;
-  return Math.min(max, Math.max(min, parsed));
-}
-
-function getProviderPresets() {
-  return {
-    openai: {
-      label: 'OpenAI',
-      type: 'openai-compatible',
-      baseUrl: 'https://api.openai.com/v1',
-      defaultModel: 'gpt-4.1-mini'
-    },
-    deepseek: {
-      label: 'DeepSeek',
-      type: 'openai-compatible',
-      baseUrl: 'https://api.deepseek.com/v1',
-      defaultModel: 'deepseek-chat'
-    },
-    minimax: {
-      label: 'Minimax',
-      type: 'openai-compatible',
-      baseUrl: 'https://api.minimax.chat/v1',
-      defaultModel: 'MiniMax-Text-01'
-    },
-    claude: {
-      label: 'Claude',
-      type: 'anthropic',
-      baseUrl: 'https://api.anthropic.com/v1',
-      defaultModel: 'claude-3-5-sonnet-latest'
-    },
-    gemini: {
-      label: 'Gemini',
-      type: 'gemini',
-      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-      defaultModel: 'gemini-1.5-flash'
-    }
-  };
-}
-
-function getProviderApiKey(provider) {
-  const keyByProvider = {
-    openai: process.env.OPENAI_API_KEY,
-    deepseek: process.env.DEEPSEEK_API_KEY,
-    minimax: process.env.MINIMAX_API_KEY,
-    claude: process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY,
-    gemini: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY
-  };
-  return keyByProvider[provider] || process.env.AI_API_KEY || '';
-}
-
 async function requestAnalysisPlan(context) {
   const system = [
     'You are a careful game data analyst generating safe SQLite analysis plans.',
@@ -3110,74 +2942,6 @@ function buildChartOption(plan, rows) {
       name: yField
     }]
   };
-}
-
-function generatePlayerListHTML(players, pagination) {
-  const { page, totalPages } = pagination;
-  const prevLink = page > 1
-    ? `<a href="/logs/list?page=${page - 1}" style="padding:10px 20px; background:#6c757d; color:white; border-radius:4px; text-decoration:none;">Previous</a>`
-    : `<span style="color:#999;">Previous</span>`;
-  const nextLink = page < totalPages
-    ? `<a href="/logs/list?page=${page + 1}" style="padding:10px 20px; background:#007bff; color:white; border-radius:4px; text-decoration:none;">Next</a>`
-    : `<span style="color:#999;">No more players</span>`;
-
-  return `<html><head><title>Players</title><style>body{font-family:sans-serif;max-width:800px;margin:20px auto;background:#f4f4f4}.card{background:white;padding:20px;border-radius:8px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}table{width:100%;border-collapse:collapse}th,td{padding:12px;text-align:left;border-bottom:1px solid #eee}a{color:#007bff;text-decoration:none}</style></head>
-  <body><div class="card"><h2>Player Logs</h2><table><tr><th>Player ID</th><th>Sessions</th><th>Last Active</th><th>Action</th></tr>
-  ${players.map((player) => `<tr><td>${escapeHtml(player.owner)}</td><td>${player.totalSessions}</td><td>${new Date(player.lastModified).toLocaleString()}</td><td><a href="/logs?owner=${encodeURIComponent(player.owner)}">View</a></td></tr>`).join('')}
-  </table>
-  <div style="margin-top:20px; display:flex; justify-content:space-between;">${prevLink}${nextLink}</div>
-  </div><p><a href="/">← Home</a></p></body></html>`;
-}
-
-function generateLogViewHTML(data) {
-  return `<html><head><title>${escapeHtml(data.owner)}</title><style>body{font-family:sans-serif;margin:20px;background:#f9f9f9}.session{background:white;padding:15px;margin-bottom:15px;border-radius:8px;border-left:5px solid #007bff}.log{font-family:monospace;font-size:12px;padding:4px;border-bottom:1px solid #f0f0f0}.Error{color:red}.Warning{color:#856404;background:#fff3cd}</style></head>
-  <body><h1>Logs: ${escapeHtml(data.owner)}</h1><a href="/logs/list">← Back to List</a>
-  ${data.sessions.map((session) => `
-    <div class="session">
-      <strong>Session: ${escapeHtml(session.sessionId)}</strong> (Received: ${new Date(session.receivedAt).toLocaleString()})
-      <div style="margin-top:10px">
-        ${renderLogGroups(session.logs)}
-      </div>
-    </div>
-  `).join('')}
-  </body></html>`;
-}
-
-function renderLogGroups(logGroups) {
-  return Object.entries(logGroups || {}).map(([category, items]) => {
-    return (Array.isArray(items) ? items : []).map((entry) => {
-      const level = entry && entry.level ? String(entry.level) : '';
-      const timestamp = entry && entry.timestamp ? String(entry.timestamp) : '';
-      const message = entry && entry.message ? String(entry.message) : '';
-      return `<div class="log ${escapeHtml(level)}">[${escapeHtml(timestamp)}] [${escapeHtml(category)}] ${escapeHtml(message)}</div>`;
-    }).join('');
-  }).join('');
-}
-
-function ensureDataDirectory(filePath) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-}
-
-function parsePositiveInteger(value, fallback) {
-  const parsed = parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function safeJsonParse(value, fallback) {
-  try {
-    return JSON.parse(value);
-  } catch (_error) {
-    return fallback;
-  }
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
 }
 
 function sendError(res, message, status) {

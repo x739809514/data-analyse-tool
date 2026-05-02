@@ -27,6 +27,7 @@
             Data Source
             <select id="sourceTypeSelect">
               <option value="sqlite">Local SQLite on backend</option>
+              <option value="amazonIvyServer">AmazonIvyServer</option>
               <option value="cloudflareWorker">Cloudflare Worker</option>
               <option value="gameLoggerHttp">Game Logger HTTP API</option>
               <option value="customHttp">Custom Worker / HTTP JSON</option>
@@ -34,7 +35,7 @@
           </label>
           <label id="sourceUrlLabel">
             Data Source URL
-            <input id="sourceUrlInput" placeholder="https://your-worker.workers.dev">
+            <input id="sourceUrlInput" placeholder="https://your-amazon-ivy-server.example.com">
           </label>
           <label id="sourceConfigLabel">
             Tables Config JSON
@@ -42,7 +43,7 @@
           </label>
           <button id="syncSource" type="button">Sync Data Source</button>
           <span id="syncMessage" class="server-message">No sync yet</span>
-          <span class="server-message">Cloudflare Worker and ECS are configured here as data sources.</span>
+          <span class="server-message">AmazonIvyServer, Cloudflare Worker, and ECS are configured here as data sources.</span>
         </div>
         <button id="refreshTables" class="primary-button" type="button">Refresh</button>
         <div id="tableList" class="table-list"></div>

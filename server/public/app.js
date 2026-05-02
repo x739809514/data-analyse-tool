@@ -94,7 +94,7 @@ function bindEvents() {
     await reloadCurrentSourceView();
   });
   els.sourceUrlInput.addEventListener('change', async () => {
-    state.sourceUrl = normalizeOptionalUrl(els.sourceUrlInput.value);
+    state.sourceUrl = normalizeSourceUrlForType(els.sourceUrlInput.value, state.sourceType);
     els.sourceUrlInput.value = state.sourceUrl;
     saveSettings();
     await reloadCurrentSourceView();
@@ -319,6 +319,7 @@ function syncSourceControls() {
   els.sourceConfigLabel.style.display = isCustom ? 'grid' : 'none';
   els.syncSource.style.display = isRemote ? 'block' : 'none';
   els.syncMessage.style.display = isRemote ? 'block' : 'none';
+  els.sourceUrlInput.placeholder = getSourceUrlPlaceholder(els.sourceTypeSelect.value);
   if (!isRemote) {
     els.sourceUrlInput.value = '';
     els.syncMessage.textContent = 'No sync needed for Local SQLite';
@@ -327,7 +328,7 @@ function syncSourceControls() {
 
 async function syncDataSource() {
   if (state.sourceType === 'sqlite') return;
-  state.sourceUrl = normalizeOptionalUrl(els.sourceUrlInput.value);
+  state.sourceUrl = normalizeSourceUrlForType(els.sourceUrlInput.value, state.sourceType);
   els.sourceUrlInput.value = state.sourceUrl;
   saveSettings();
   els.syncSource.disabled = true;
@@ -591,7 +592,7 @@ function saveSettings() {
   const settings = {
     serverUrl: normalizeServerUrl(els.serverUrlInput.value || state.serverUrl),
     sourceType: els.sourceTypeSelect.value,
-    sourceUrl: normalizeOptionalUrl(els.sourceUrlInput.value),
+    sourceUrl: normalizeSourceUrlForType(els.sourceUrlInput.value, els.sourceTypeSelect.value),
     sourceConfig: els.sourceConfigInput.value.trim(),
     provider: els.providerSelect.value,
     model: els.modelInput.value.trim(),
@@ -635,8 +636,25 @@ function normalizeOptionalUrl(value) {
   return text ? normalizeServerUrl(text) : '';
 }
 
+function normalizeSourceUrlForType(value, type) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (type === 'amazonIvyServer' && !/^https?:\/\//i.test(text)) {
+    return normalizeServerUrl(`https://${text}`);
+  }
+  return normalizeOptionalUrl(text);
+}
+
 function normalizeSourceTypeForApi(type) {
-  return type === 'cloudflareWorker' ? 'gameLoggerHttp' : type;
+  return ['amazonIvyServer', 'cloudflareWorker'].includes(type) ? type : type;
+}
+
+function getSourceUrlPlaceholder(type) {
+  if (type === 'amazonIvyServer') return 'https://your-amazon-ivy-server.example.com';
+  if (type === 'cloudflareWorker') return 'https://your-worker.workers.dev';
+  if (type === 'gameLoggerHttp') return 'https://your-game-logger.example.com';
+  if (type === 'customHttp') return 'https://your-json-worker.example.com';
+  return '';
 }
 
 function formatCell(value, column) {
